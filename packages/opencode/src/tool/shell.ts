@@ -124,6 +124,20 @@ function commands(node: Node) {
   return node.descendantsOfType("command").filter((child): child is Node => Boolean(child))
 }
 
+function children(node: Node) {
+  return Array.from({ length: node.childCount }, (_, index) => node.child(index)).filter((child): child is Node =>
+    Boolean(child),
+  )
+}
+
+function named(node: Node) {
+  return children(node).filter((child) => child.isNamed)
+}
+
+function statement(node: Node) {
+  return named(node).find((child) => !child.type.includes("redirect") && !child.type.includes("heredoc"))
+}
+
 function unquote(text: string) {
   if (text.length < 2) return text
   const first = text[0]
@@ -389,18 +403,18 @@ export const ShellTool = Tool.define(
       }
       const shellKind = ShellID.toKind(Shell.name(shell))
 
-      for (const node of commands(root)) {
+      const note = Effect.fn("ShellTool.note")(function* (node: Node, dir: string) {
         const command = parts(node)
         const tokens = command.map((item) => item.text)
         const cmd = ps || shellKind === "cmd" ? tokens[0]?.toLowerCase() : tokens[0]
 
         if (cmd && (FILES.has(cmd) || (shellKind === "cmd" && CMD_FILES.has(cmd)))) {
           for (const arg of pathArgs(command, ps, shellKind === "cmd")) {
-            const resolved = yield* argPath(arg, cwd, ps, shell)
+            const resolved = yield* argPath(arg, dir, ps, shell)
             yield* Effect.logInfo("resolved path", { arg, resolved })
             if (!resolved || containsPath(resolved, instance)) continue
-            const dir = (yield* fs.isDir(resolved)) ? resolved : path.dirname(resolved)
-            scan.dirs.add(dir)
+            const found = (yield* fs.isDir(resolved)) ? resolved : path.dirname(resolved)
+            scan.dirs.add(found)
           }
         }
 
@@ -408,8 +422,137 @@ export const ShellTool = Tool.define(
           scan.patterns.add(source(node))
           scan.always.add(BashArity.prefix(tokens).join(" ") + " *")
         }
+      })
+
+      // PowerShell trees do not share the bash list/pipeline shape, so keep the flat scan.
+      if (ps) {
+        for (const node of commands(root)) yield* note(node, cwd)
+        return scan
       }
 
+      // A successful `cd` in the current shell changes the directory later commands are checked against.
+      // Pipelines and `&` run in subshells, so they must not leak that directory. A `cd` on the right of
+      // `||` runs only when the left side failed; persist it only when that left side is a `cd` whose
+      // target does not exist.
+      const entered = Effect.fn("ShellTool.entered")(function* (node: Node, dir: string) {
+        const command = parts(node)
+        const name = command[0]?.text
+        if (name !== "cd" && name !== "chdir") return
+        const args = pathArgs(command, ps, shellKind === "cmd")
+        if (args.length !== 1) return
+        const resolved = yield* argPath(args[0], dir, ps, shell)
+        if (!resolved || !(yield* fs.isDir(resolved))) return
+        return resolved
+      })
+
+      const failedCd = (node: Node, carried: boolean) => {
+        if (carried) return false
+        const command = node.type === "command" ? node : statement(node)
+        if (command?.type !== "command") return false
+        const name = parts(command)[0]?.text
+        return name === "cd" || name === "chdir"
+      }
+
+      type Walk = { dir: string; carried: boolean }
+      const step: (node: Node, dir: string) => Effect.Effect<Walk> = Effect.fn("ShellTool.step")(function* (
+        node: Node,
+        dir: string,
+      ) {
+        if (node.type === "command") {
+          yield* note(node, dir)
+          const next = yield* entered(node, dir)
+          if (next) return { dir: next, carried: true }
+          return { dir, carried: false }
+        }
+        if (node.type === "redirected_statement") {
+          const inner = statement(node)
+          if (!inner) return { dir, carried: false }
+          return yield* step(inner, dir)
+        }
+        if (node.type === "pipeline" || node.type === "subshell") {
+          for (const child of named(node)) yield* step(child, dir)
+          return { dir, carried: false }
+        }
+        if (node.type === "list") return yield* andOr(node, dir)
+        if (node.type === "program") return { dir: yield* sequence(node, dir), carried: false }
+        for (const child of commands(node)) yield* note(child, dir)
+        return { dir, carried: false }
+      })
+
+      const andOr = Effect.fn("ShellTool.andOr")(function* (node: Node, dir: string) {
+        let current = dir
+        let previous = dir
+        let op = ""
+        let carried = false
+        let failed = false
+        for (const child of children(node)) {
+          if (child.type === "&&" || child.type === "||") {
+            op = child.type
+            continue
+          }
+          if (!child.isNamed) continue
+          if (op === "||" && carried) {
+            yield* step(child, previous)
+            carried = false
+            failed = false
+            continue
+          }
+          if (op === "||" && !failed) {
+            yield* step(child, current)
+            carried = false
+            failed = false
+            continue
+          }
+          if (op === "&&" && !carried) {
+            yield* step(child, current)
+            carried = false
+            failed = false
+            continue
+          }
+          previous = current
+          const walked = yield* step(child, current)
+          carried = walked.carried
+          failed = failedCd(child, walked.carried)
+          current = walked.dir
+        }
+        return { dir: current, carried }
+      })
+
+      const sequence = Effect.fn("ShellTool.sequence")(function* (node: Node, dir: string) {
+        const items: { node: Node; background: boolean }[] = []
+        let pending: Node | undefined
+        const push = (background: boolean) => {
+          if (!pending) return
+          items.push({ node: pending, background })
+          pending = undefined
+        }
+        for (const child of children(node)) {
+          if (!child.isNamed && (child.type === ";" || child.type === "\n")) {
+            push(false)
+            continue
+          }
+          if (!child.isNamed && child.type === "&") {
+            push(true)
+            continue
+          }
+          if (!child.isNamed) continue
+          push(false)
+          pending = child
+        }
+        push(false)
+
+        let current = dir
+        for (const item of items) {
+          if (item.background) {
+            yield* step(item.node, current)
+            continue
+          }
+          current = (yield* step(item.node, current)).dir
+        }
+        return current
+      })
+
+      yield* step(root, cwd)
       return scan
     })
 

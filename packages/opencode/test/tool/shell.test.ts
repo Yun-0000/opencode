@@ -3,6 +3,7 @@ import { describe, expect } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit, Layer } from "effect"
 import type * as Scope from "effect/Scope"
+import { mkdir } from "node:fs/promises"
 import os from "os"
 import path from "path"
 import { Config } from "@/config/config"
@@ -751,6 +752,53 @@ describe("tool.shell permissions", () => {
           ).toMatchObject({ message: err.message })
           const extDirReq = requests.find((r) => r.permission === "external_directory")
           expect(extDirReq).toBeDefined()
+        }),
+      )
+    }),
+  )
+
+  each("resolves a later cd from an earlier cd in the same command", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* Effect.promise(async () => {
+        await mkdir(path.join(tmp, "src", "playwright-tests"), { recursive: true })
+        await mkdir(path.join(tmp, "go"), { recursive: true })
+      })
+      yield* runIn(
+        tmp,
+        Effect.gen(function* () {
+          const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          const result = yield* run(
+            {
+              command: "cd go && echo in-go; cd ../src/playwright-tests && echo in-src",
+            },
+            capture(requests),
+          )
+          expect(requests.find((item) => item.permission === "external_directory")).toBeUndefined()
+          expect(result.output).toContain("in-src")
+        }),
+      )
+    }),
+  )
+
+  each("does not keep cwd from a cd inside a pipeline", () =>
+    Effect.gen(function* () {
+      const tmp = yield* tmpdirScoped()
+      yield* Effect.promise(() => mkdir(path.join(tmp, "go"), { recursive: true }))
+      yield* runIn(
+        tmp,
+        Effect.gen(function* () {
+          const err = new Error("stop after permission")
+          const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          expect(
+            yield* fail(
+              {
+                command: "cd go | true; cd ..",
+              },
+              capture(requests, err),
+            ),
+          ).toMatchObject({ message: err.message })
+          expect(requests.find((item) => item.permission === "external_directory")).toBeDefined()
         }),
       )
     }),
