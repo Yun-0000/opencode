@@ -88,6 +88,16 @@ const resolveWasm = (asset: string) => {
   return fileURLToPath(url)
 }
 
+function leadingAssignments(node: Node) {
+  const out: string[] = []
+  for (let i = 0; i < node.childCount; i++) {
+    const child = node.child(i)
+    if (!child || child.type !== "variable_assignment") break
+    out.push(child.text)
+  }
+  return out
+}
+
 function parts(node: Node) {
   const out: Part[] = []
   for (let i = 0; i < node.childCount; i++) {
@@ -406,7 +416,8 @@ export const ShellTool = Tool.define(
 
         if (tokens.length && (!cmd || !CWD.has(cmd))) {
           scan.patterns.add(source(node))
-          scan.always.add(BashArity.prefix(tokens).join(" ") + " *")
+          // Assignments are not the command. cd and file checks keep using `tokens`.
+          scan.always.add(BashArity.prefix([...leadingAssignments(node), ...tokens]).join(" ") + " *")
         }
       }
 

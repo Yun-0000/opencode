@@ -10,7 +10,7 @@ import { Shell } from "@opencode-ai/core/shell"
 import { ShellTool } from "../../src/tool/shell"
 import { Filesystem } from "@/util/filesystem"
 import { provideInstance, testInstanceStoreLayer, tmpdirScoped } from "../fixture/fixture"
-import type { Permission } from "../../src/permission"
+import { Permission } from "../../src/permission"
 import { Agent } from "../../src/agent/agent"
 import { Truncate } from "@/tool/truncate"
 import { SessionID, MessageID } from "../../src/session/schema"
@@ -1000,6 +1000,50 @@ describe("tool.shell permissions", () => {
           const bashReq = requests.find((r) => r.permission === "bash")
           expect(bashReq).toBeDefined()
           expect(bashReq!.always[0]).toBe("ls *")
+        }),
+      )
+    }),
+  )
+
+  it.live("keeps a leading environment assignment in the always-allow pattern", () =>
+    Effect.gen(function* () {
+      const outer = yield* tmpdirScoped()
+      yield* Effect.promise(() => Bun.write(path.join(outer, "outside.txt"), "x"))
+      const tmp = yield* tmpdirScoped()
+      yield* runIn(
+        tmp,
+        Effect.gen(function* () {
+          const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          yield* run({ command: "FOO=1 true" }, capture(requests))
+          const bashReq = requests.find((r) => r.permission === "bash")
+          expect(bashReq).toBeDefined()
+          expect(bashReq!.patterns).toContain("FOO=1 true")
+          expect(bashReq!.always).toEqual(["FOO=1 *"])
+          const saved = bashReq!.always.map((pattern) => ({
+            permission: "bash" as const,
+            pattern,
+            action: "allow" as const,
+          }))
+          expect(Permission.evaluate("bash", "FOO=1 true", saved).action).toBe("allow")
+          expect(Permission.evaluate("bash", "FOO=1 echo hello", saved).action).toBe("allow")
+          expect(Permission.evaluate("bash", "true", saved).action).toBe("ask")
+          expect(Permission.evaluate("bash", "FOO=12 true", saved).action).toBe("ask")
+
+          const plain: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          yield* run({ command: "git status" }, capture(plain))
+          expect(plain.find((r) => r.permission === "bash")?.always).toEqual(["git status *"])
+
+          const cd: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          yield* run({ command: "FOO=1 cd ." }, capture(cd))
+          expect(cd.find((r) => r.permission === "bash")).toBeUndefined()
+
+          const file = path.join(outer, "outside.txt")
+          const outside: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+          yield* run({ command: `FOO=1 cat ${file}` }, capture(outside))
+          expect(outside.find((r) => r.permission === "external_directory")?.patterns).toContain(
+            glob(path.join(outer, "*")),
+          )
+          expect(outside.find((r) => r.permission === "bash")?.always).toEqual(["FOO=1 *"])
         }),
       )
     }),
